@@ -1,0 +1,312 @@
+/**
+ * Reparando SaaS — WhatsApp worker (Baileys, multi-tenant).
+ *
+ * One always-on process that holds a WhatsApp Web session per store (org) and
+ * bridges it to Supabase:
+ *   - reads/writes wa_connections (status, qr, creds, phone, heartbeat)
+ *   - writes inbound messages to wa_conversations / wa_messages
+ *   - drains wa_outbox (throttled, rate-limited) to send outbound messages
+ *
+ * It authenticates to Supabase with the SERVICE ROLE key (bypasses RLS), so
+ * this process must NEVER be exposed publicly — it only talks OUT to Supabase.
+ *
+ * Env:
+ *   SUPABASE_URL                 e.g. https://cfotlppderfzdmspsjjn.supabase.co
+ *   SUPABASE_SERVICE_ROLE_KEY    service_role key (secret)
+ *   POLL_MS                      connection reconcile interval (default 4000)
+ *   PUMP_MS                      outbox drain interval (default 1500)
+ */
+import makeWASocket, {
+  DisconnectReason,
+  initAuthCreds,
+  BufferJSON,
+  proto,
+  fetchLatestBaileysVersion,
+  type AuthenticationState,
+  type WASocket,
+} from "@whiskeysockets/baileys";
+import { Boom } from "@hapi/boom";
+import { createClient } from "@supabase/supabase-js";
+import QRCode from "qrcode";
+import pino from "pino";
+
+const log = pino({ level: process.env.LOG_LEVEL || "info" });
+
+const SUPABASE_URL = must("SUPABASE_URL");
+const SERVICE_KEY = must("SUPABASE_SERVICE_ROLE_KEY");
+const POLL_MS = int(process.env.POLL_MS, 4000);
+const PUMP_MS = int(process.env.PUMP_MS, 1500);
+
+const supa = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
+
+function must(k: string): string {
+  const v = process.env[k];
+  if (!v) { log.error(`Missing env ${k}`); process.exit(1); }
+  return v;
+}
+function int(v: string | undefined, d: number) { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : d; }
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const jidOf = (phone: string) => `${phone.replace(/[^0-9]/g, "")}@s.whatsapp.net`;
+const digits = (s: string | null | undefined) => (s || "").replace(/[^0-9]/g, "");
+
+type Row = Record<string, any>;
+
+interface Session {
+  orgId: string;
+  sock: WASocket | null;
+  starting: boolean;
+  lastSendAt: number;      // for min_gap throttle
+  cfg: { min_gap_ms: number; per_min_cap: number; daily_cap: number };
+}
+const sessions = new Map<string, Session>();
+
+/* --------------------------- Supabase auth state --------------------------- */
+/** Baileys auth state persisted in wa_connections.creds (jsonb). */
+async function useSupabaseAuthState(orgId: string): Promise<{ state: AuthenticationState; saveCreds: () => Promise<void> }> {
+  const { data } = await supa.from("wa_connections").select("creds").eq("org_id", orgId).single();
+  const stored = data?.creds ? JSON.parse(JSON.stringify(data.creds), BufferJSON.reviver) : null;
+  const creds = stored?.creds || initAuthCreds();
+  const keys: Row = stored?.keys || {};
+
+  const saveCreds = async () => {
+    const serial = JSON.parse(JSON.stringify({ creds, keys }, BufferJSON.replacer));
+    await supa.from("wa_connections").update({ creds: serial, updated_at: new Date().toISOString() }).eq("org_id", orgId);
+  };
+
+  const state: AuthenticationState = {
+    creds,
+    keys: {
+      get: (type, ids) => {
+        const out: Row = {};
+        for (const id of ids) {
+          let val = keys[type]?.[id];
+          if (type === "app-state-sync-key" && val) val = proto.Message.AppStateSyncKeyData.fromObject(val);
+          if (val) out[id] = val;
+        }
+        return out;
+      },
+      set: (data) => {
+        for (const type in data) {
+          keys[type] = keys[type] || {};
+          Object.assign(keys[type], (data as Row)[type]);
+        }
+        // fire-and-forget; connection.update/creds.update also persist
+        void saveCreds();
+      },
+    },
+  };
+  return { state, saveCreds };
+}
+
+async function patch(orgId: string, fields: Row) {
+  await supa.from("wa_connections").update({ ...fields, updated_at: new Date().toISOString() }).eq("org_id", orgId);
+}
+
+/* ------------------------------- Session boot ------------------------------ */
+async function startSession(orgId: string, cfg: Session["cfg"]) {
+  let s = sessions.get(orgId);
+  if (s?.sock || s?.starting) return;
+  s = s || { orgId, sock: null, starting: false, lastSendAt: 0, cfg };
+  s.cfg = cfg;
+  s.starting = true;
+  sessions.set(orgId, s);
+
+  try {
+    const { state, saveCreds } = await useSupabaseAuthState(orgId);
+    const { version } = await fetchLatestBaileysVersion();
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: false,
+      markOnlineOnConnect: false,
+      browser: ["Reparando", "Chrome", "1.0"],
+      logger: pino({ level: "silent" }) as any,
+    });
+    s.sock = sock;
+    s.starting = false;
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (u) => {
+      const { connection, lastDisconnect, qr } = u;
+      if (qr) {
+        const dataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 320 });
+        await patch(orgId, { status: "qr", qr: dataUrl, worker_error: null, last_seen_at: new Date().toISOString() });
+        log.info({ orgId }, "qr ready");
+      }
+      if (connection === "connecting") await patch(orgId, { status: "connecting", last_seen_at: new Date().toISOString() });
+      if (connection === "open") {
+        const phone = digits(sock.user?.id?.split(":")[0]);
+        await patch(orgId, {
+          status: "connected", qr: null, phone_number: phone || null,
+          connected_at: new Date().toISOString(), last_seen_at: new Date().toISOString(), worker_error: null,
+        });
+        log.info({ orgId, phone }, "connected");
+      }
+      if (connection === "close") {
+        const code = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
+        const loggedOut = code === DisconnectReason.loggedOut;
+        sessions.delete(orgId);
+        try { sock.end(undefined as any); } catch { /* noop */ }
+        if (loggedOut) {
+          await patch(orgId, { status: "disconnected", enabled: false, qr: null, creds: null, phone_number: null });
+          log.warn({ orgId }, "logged out — cleared session");
+        } else {
+          await patch(orgId, { status: "connecting", qr: null, worker_error: String(lastDisconnect?.error?.message || code || "close") });
+          log.warn({ orgId, code }, "closed — will reconnect");
+        }
+      }
+    });
+
+    sock.ev.on("messages.upsert", async (up) => {
+      if (up.type !== "notify") return;
+      for (const m of up.messages) {
+        try {
+          if (m.key.fromMe || !m.key.remoteJid) continue;
+          if (m.key.remoteJid.endsWith("@g.us") || m.key.remoteJid === "status@broadcast") continue; // ignore groups/status
+          const phone = digits(m.key.remoteJid.split("@")[0]);
+          const text = m.message?.conversation
+            || m.message?.extendedTextMessage?.text
+            || m.message?.imageMessage?.caption
+            || m.message?.videoMessage?.caption
+            || "";
+          const name = m.pushName || null;
+          await recordInbound(orgId, phone, name, text);
+        } catch (e) { log.error({ orgId, e }, "inbound handling failed"); }
+      }
+    });
+  } catch (e) {
+    s.starting = false;
+    sessions.delete(orgId);
+    await patch(orgId, { status: "connecting", worker_error: String((e as Error)?.message || e) });
+    log.error({ orgId, e }, "startSession failed");
+  }
+}
+
+async function stopSession(orgId: string) {
+  const s = sessions.get(orgId);
+  if (s?.sock) { try { s.sock.end(undefined as any); } catch { /* noop */ } }
+  sessions.delete(orgId);
+}
+
+async function logoutSession(orgId: string) {
+  const s = sessions.get(orgId);
+  try { await s?.sock?.logout(); } catch { /* noop */ }
+  await stopSession(orgId);
+  await patch(orgId, { status: "disconnected", enabled: false, qr: null, creds: null, phone_number: null });
+  log.info({ orgId }, "unlinked");
+}
+
+/* ------------------------------ Inbound writes ----------------------------- */
+async function recordInbound(orgId: string, phone: string, name: string | null, text: string) {
+  // find/create conversation
+  const { data: convs } = await supa.from("wa_conversations").select("id, unread")
+    .eq("org_id", orgId).eq("wa_phone", phone).limit(1);
+  let convId = convs?.[0]?.id as string | undefined;
+  if (!convId) {
+    const { data: ins } = await supa.from("wa_conversations").insert({
+      org_id: orgId, wa_phone: phone, wa_name: name, status: "open", unread: 1,
+      last_message_at: new Date().toISOString(), last_text: text, last_direction: "in",
+    }).select("id").single();
+    convId = ins?.id;
+  } else {
+    await supa.from("wa_conversations").update({
+      wa_name: name || undefined, last_message_at: new Date().toISOString(),
+      last_text: text, last_direction: "in", unread: (convs![0].unread || 0) + 1,
+    }).eq("id", convId);
+  }
+  if (convId) {
+    await supa.from("wa_messages").insert({
+      org_id: orgId, conversation_id: convId, direction: "in", body: text, status: "received",
+    });
+  }
+}
+
+/* ------------------------------- Outbox pump ------------------------------- */
+async function pumpOutbox() {
+  for (const [orgId, s] of sessions) {
+    if (!s.sock) continue;
+    const now = Date.now();
+    if (now - s.lastSendAt < s.cfg.min_gap_ms) continue; // throttle per org
+
+    // rate caps (defense-in-depth; wa_enqueue also checks)
+    const sinceMin = new Date(now - 60_000).toISOString();
+    const [{ count: minCount }, { count: dayCount }] = await Promise.all([
+      supa.from("wa_messages").select("id", { count: "exact", head: true })
+        .eq("org_id", orgId).eq("direction", "out").gte("created_at", sinceMin),
+      supa.from("wa_messages").select("id", { count: "exact", head: true })
+        .eq("org_id", orgId).eq("direction", "out").gte("created_at", new Date(new Date().toDateString()).toISOString()),
+    ]);
+    if ((minCount ?? 0) >= s.cfg.per_min_cap || (dayCount ?? 0) >= s.cfg.daily_cap) continue;
+
+    // claim one queued row atomically
+    const { data: claim } = await supa.rpc("wa_claim_outbox", { p_org: orgId });
+    const row = Array.isArray(claim) ? claim[0] : claim;
+    if (!row) continue;
+
+    try {
+      const exists = await s.sock.onWhatsApp(row.to_phone).catch(() => []);
+      if (!exists || !exists[0]?.exists) {
+        await supa.from("wa_outbox").update({ status: "failed", error: "número sin WhatsApp", attempts: (row.attempts || 0) + 1 }).eq("id", row.id);
+        continue;
+      }
+      const jid = exists[0].jid || jidOf(row.to_phone);
+      await s.sock.sendMessage(jid, { text: row.body || "" });
+      s.lastSendAt = Date.now();
+      await supa.from("wa_outbox").update({ status: "sent", sent_at: new Date().toISOString() }).eq("id", row.id);
+
+      // mirror into the inbox thread
+      const { data: convs } = await supa.from("wa_conversations").select("id").eq("org_id", orgId).eq("wa_phone", row.to_phone).limit(1);
+      let convId = convs?.[0]?.id as string | undefined;
+      if (!convId) {
+        const { data: ins } = await supa.from("wa_conversations").insert({
+          org_id: orgId, wa_phone: row.to_phone, status: "open", unread: 0,
+          last_message_at: new Date().toISOString(), last_text: row.body, last_direction: "out",
+        }).select("id").single();
+        convId = ins?.id;
+      } else {
+        await supa.from("wa_conversations").update({ last_message_at: new Date().toISOString(), last_text: row.body, last_direction: "out" }).eq("id", convId);
+      }
+      if (convId) await supa.from("wa_messages").insert({ org_id: orgId, conversation_id: convId, direction: "out", body: row.body, status: "sent", created_by: row.created_by });
+    } catch (e) {
+      await supa.from("wa_outbox").update({ status: "failed", error: String((e as Error)?.message || e), attempts: (row.attempts || 0) + 1 }).eq("id", row.id);
+      log.error({ orgId, e }, "send failed");
+    }
+  }
+}
+
+/* ------------------------------- Reconcile -------------------------------- */
+async function reconcile() {
+  const { data, error } = await supa.from("wa_connections")
+    .select("org_id, provider, enabled, status, min_gap_ms, per_min_cap, daily_cap")
+    .eq("provider", "baileys");
+  if (error) { log.error({ error }, "reconcile query failed"); return; }
+
+  const seen = new Set<string>();
+  for (const c of (data as Row[]) ?? []) {
+    seen.add(c.org_id);
+    const cfg = { min_gap_ms: c.min_gap_ms ?? 3500, per_min_cap: c.per_min_cap ?? 10, daily_cap: c.daily_cap ?? 250 };
+    if (c.status === "logout") { await logoutSession(c.org_id); continue; }
+    if (!c.enabled) { await stopSession(c.org_id); continue; }
+    // pending/qr/connecting/connected → ensure a live session; heartbeat if connected
+    if (!sessions.has(c.org_id)) await startSession(c.org_id, cfg);
+    else {
+      const s = sessions.get(c.org_id)!; s.cfg = cfg;
+      if (c.status === "connected") await patch(c.org_id, { last_seen_at: new Date().toISOString() });
+    }
+  }
+  // stop sessions whose row disappeared
+  for (const orgId of [...sessions.keys()]) if (!seen.has(orgId)) await stopSession(orgId);
+}
+
+async function main() {
+  log.info("wa-worker starting");
+  // loops
+  const loop = async (fn: () => Promise<void>, ms: number) => {
+    for (;;) { try { await fn(); } catch (e) { log.error({ e }, "loop error"); } await sleep(ms); }
+  };
+  loop(reconcile, POLL_MS);
+  loop(pumpOutbox, PUMP_MS);
+}
+
+main();
