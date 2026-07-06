@@ -73,6 +73,16 @@ async function displayPhoneFor(sock: WASocket, jid: string): Promise<string> {
 
 type Row = Record<string, any>;
 
+// Cache of recently-sent messages so we can answer WhatsApp "retry receipts".
+// Without this, recipients get stuck on "Waiting for this message…" because the
+// sender can't re-encrypt the message when the recipient requests a resend.
+const sentMsgCache = new Map<string, any>();
+function cacheSent(id: string | null | undefined, message: any) {
+  if (!id || !message) return;
+  sentMsgCache.set(id, message);
+  if (sentMsgCache.size > 2000) { const first = sentMsgCache.keys().next().value; if (first) sentMsgCache.delete(first); }
+}
+
 interface Session {
   orgId: string;
   sock: WASocket | null;
@@ -143,6 +153,8 @@ async function startSession(orgId: string, cfg: Session["cfg"]) {
       markOnlineOnConnect: false,
       browser: ["Reparando", "Chrome", "1.0"],
       logger: pino({ level: "silent" }) as any,
+      // Answer retry receipts so recipients don't get stuck on "Waiting for this message".
+      getMessage: async (key) => (key?.id ? sentMsgCache.get(key.id) : undefined),
     });
     s.sock = sock;
     s.starting = false;
@@ -284,7 +296,8 @@ async function pumpOutbox() {
         jid = exists[0].jid || jidOf(row.to_phone);
       }
 
-      await s.sock.sendMessage(jid, { text: row.body || "" });
+      const sent = await s.sock.sendMessage(jid, { text: row.body || "" });
+      cacheSent(sent?.key?.id, sent?.message); // enable retry-receipt resends
       s.lastSendAt = Date.now();
       await supa.from("wa_outbox").update({ status: "sent", sent_at: new Date().toISOString() }).eq("id", row.id);
 
