@@ -49,6 +49,28 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const jidOf = (phone: string) => `${phone.replace(/[^0-9]/g, "")}@s.whatsapp.net`;
 const digits = (s: string | null | undefined) => (s || "").replace(/[^0-9]/g, "");
 
+// Chat addresses we never want to treat as customer conversations.
+function isIgnorableJid(jid: string): boolean {
+  return jid.endsWith("@g.us")            // groups
+    || jid.endsWith("@newsletter")        // channels / newsletters
+    || jid.endsWith("@broadcast")         // broadcast lists
+    || jid === "status@broadcast";        // status updates
+}
+
+/** Best-effort: turn a privacy LID (…@lid) into the real phone for display.
+ *  Falls back to the raw digits if WhatsApp doesn't expose a mapping. */
+async function displayPhoneFor(sock: WASocket, jid: string): Promise<string> {
+  const base = digits(jid.split("@")[0]);
+  if (!jid.endsWith("@lid")) return base;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo: any = (sock as any).signalRepository;
+    const pn = await repo?.lidMapping?.getPNForLID?.(jid);
+    if (pn && typeof pn === "string") { const d = digits(pn.split("@")[0]); if (d) return d; }
+  } catch { /* mapping not available on this version */ }
+  return base;
+}
+
 type Row = Record<string, any>;
 
 interface Session {
@@ -162,16 +184,17 @@ async function startSession(orgId: string, cfg: Session["cfg"]) {
       if (up.type !== "notify") return;
       for (const m of up.messages) {
         try {
-          if (m.key.fromMe || !m.key.remoteJid) continue;
-          if (m.key.remoteJid.endsWith("@g.us") || m.key.remoteJid === "status@broadcast") continue; // ignore groups/status
-          const phone = digits(m.key.remoteJid.split("@")[0]);
+          const jid = m.key.remoteJid;
+          if (m.key.fromMe || !jid) continue;
+          if (isIgnorableJid(jid)) continue; // groups / channels / broadcasts / status
+          const phone = await displayPhoneFor(sock, jid);
           const text = m.message?.conversation
             || m.message?.extendedTextMessage?.text
             || m.message?.imageMessage?.caption
             || m.message?.videoMessage?.caption
             || "";
           const name = m.pushName || null;
-          await recordInbound(orgId, phone, name, text);
+          await recordInbound(orgId, phone, jid, name, text);
         } catch (e) { log.error({ orgId, e }, "inbound handling failed"); }
       }
     });
@@ -198,20 +221,20 @@ async function logoutSession(orgId: string) {
 }
 
 /* ------------------------------ Inbound writes ----------------------------- */
-async function recordInbound(orgId: string, phone: string, name: string | null, text: string) {
+async function recordInbound(orgId: string, phone: string, jid: string, name: string | null, text: string) {
   // find/create conversation
   const { data: convs } = await supa.from("wa_conversations").select("id, unread")
     .eq("org_id", orgId).eq("wa_phone", phone).limit(1);
   let convId = convs?.[0]?.id as string | undefined;
   if (!convId) {
     const { data: ins } = await supa.from("wa_conversations").insert({
-      org_id: orgId, wa_phone: phone, wa_name: name, status: "open", unread: 1,
+      org_id: orgId, wa_phone: phone, wa_jid: jid, wa_name: name, status: "open", unread: 1,
       last_message_at: new Date().toISOString(), last_text: text, last_direction: "in",
     }).select("id").single();
     convId = ins?.id;
   } else {
     await supa.from("wa_conversations").update({
-      wa_name: name || undefined, last_message_at: new Date().toISOString(),
+      wa_jid: jid, wa_name: name || undefined, last_message_at: new Date().toISOString(),
       last_text: text, last_direction: "in", unread: (convs![0].unread || 0) + 1,
     }).eq("id", convId);
   }
@@ -245,22 +268,30 @@ async function pumpOutbox() {
     if (!row) continue;
 
     try {
-      const exists = await s.sock.onWhatsApp(row.to_phone).catch(() => []);
-      if (!exists || !exists[0]?.exists) {
-        await supa.from("wa_outbox").update({ status: "failed", error: "número sin WhatsApp", attempts: (row.attempts || 0) + 1 }).eq("id", row.id);
-        continue;
+      // Prefer the exact chat address we already know (handles LID chats and lets
+      // us skip the reachability check for people who already messaged us).
+      const { data: convoRows } = await supa.from("wa_conversations").select("id, wa_jid")
+        .eq("org_id", orgId).eq("wa_phone", row.to_phone).limit(1);
+      let convId = convoRows?.[0]?.id as string | undefined;
+      let jid = convoRows?.[0]?.wa_jid as string | undefined;
+
+      if (!jid) {
+        const exists = await s.sock.onWhatsApp(row.to_phone).catch(() => []);
+        if (!exists || !exists[0]?.exists) {
+          await supa.from("wa_outbox").update({ status: "failed", error: "número sin WhatsApp", attempts: (row.attempts || 0) + 1 }).eq("id", row.id);
+          continue;
+        }
+        jid = exists[0].jid || jidOf(row.to_phone);
       }
-      const jid = exists[0].jid || jidOf(row.to_phone);
+
       await s.sock.sendMessage(jid, { text: row.body || "" });
       s.lastSendAt = Date.now();
       await supa.from("wa_outbox").update({ status: "sent", sent_at: new Date().toISOString() }).eq("id", row.id);
 
       // mirror into the inbox thread
-      const { data: convs } = await supa.from("wa_conversations").select("id").eq("org_id", orgId).eq("wa_phone", row.to_phone).limit(1);
-      let convId = convs?.[0]?.id as string | undefined;
       if (!convId) {
         const { data: ins } = await supa.from("wa_conversations").insert({
-          org_id: orgId, wa_phone: row.to_phone, status: "open", unread: 0,
+          org_id: orgId, wa_phone: row.to_phone, wa_jid: jid, status: "open", unread: 0,
           last_message_at: new Date().toISOString(), last_text: row.body, last_direction: "out",
         }).select("id").single();
         convId = ins?.id;
