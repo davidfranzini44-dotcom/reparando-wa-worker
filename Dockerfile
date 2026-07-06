@@ -2,6 +2,12 @@
 FROM node:20-slim
 WORKDIR /app
 
+# Baileys pulls libsignal from GitHub during install (needs git), and native
+# modules need a toolchain. Install them before npm install.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git python3 make g++ ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 # Install deps (incl. dev, needed to compile TypeScript)
 COPY package.json ./
 RUN npm install
