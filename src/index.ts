@@ -19,6 +19,7 @@
 import makeWASocket, {
   DisconnectReason,
   initAuthCreds,
+  makeCacheableSignalKeyStore,
   BufferJSON,
   proto,
   fetchLatestBaileysVersion,
@@ -31,6 +32,7 @@ import QRCode from "qrcode";
 import pino from "pino";
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
+const silent = pino({ level: "silent" });
 
 const SUPABASE_URL = must("SUPABASE_URL");
 const SERVICE_KEY = must("SUPABASE_SERVICE_ROLE_KEY");
@@ -120,7 +122,11 @@ async function useSupabaseAuthState(orgId: string): Promise<{ state: Authenticat
       set: (data) => {
         for (const type in data) {
           keys[type] = keys[type] || {};
-          Object.assign(keys[type], (data as Row)[type]);
+          for (const id in (data as Row)[type]) {
+            const val = (data as Row)[type][id];
+            if (val == null) delete keys[type][id]; // honor deletes
+            else keys[type][id] = val;
+          }
         }
         // fire-and-forget; connection.update/creds.update also persist
         void saveCreds();
@@ -148,11 +154,16 @@ async function startSession(orgId: string, cfg: Session["cfg"]) {
     const { version } = await fetchLatestBaileysVersion();
     const sock = makeWASocket({
       version,
-      auth: state,
+      auth: {
+        creds: state.creds,
+        // Cacheable key store: stabilizes Signal session/pre-key reads during
+        // encryption — a common cause of undecryptable "Waiting for this message".
+        keys: makeCacheableSignalKeyStore(state.keys, silent as any),
+      },
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       browser: ["Reparando", "Chrome", "1.0"],
-      logger: pino({ level: "silent" }) as any,
+      logger: silent as any,
       // Answer retry receipts so recipients don't get stuck on "Waiting for this message".
       getMessage: async (key) => (key?.id ? sentMsgCache.get(key.id) : undefined),
     });
