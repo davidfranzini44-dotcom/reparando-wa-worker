@@ -1,5 +1,6 @@
 # Reparando WhatsApp worker (Baileys) — build + run
-FROM node:20-slim
+# Node 22: has native WebSocket, required by @supabase/realtime-js.
+FROM node:22-slim
 WORKDIR /app
 
 # Baileys pulls libsignal from GitHub during install (needs git), and native
