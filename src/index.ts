@@ -176,8 +176,10 @@ async function startSession(orgId: string, cfg: Session["cfg"]) {
       },
       printQRInTerminal: false,
       markOnlineOnConnect: false,
-      browser: ["Reparando", "Chrome", "1.0"],
+      browser: ["Reparando", "Chrome", "120.0.0"],
       logger: silent as any,
+      generateHighQualityLinkPreview: false,
+      syncFullHistory: false,
       // Answer retry receipts so recipients don't get stuck on "Waiting for this message".
       getMessage: async (key) => (key?.id ? sentMsgCache.get(key.id) : undefined),
     });
