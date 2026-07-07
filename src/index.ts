@@ -18,18 +18,17 @@
  */
 import makeWASocket, {
   DisconnectReason,
-  initAuthCreds,
   makeCacheableSignalKeyStore,
-  BufferJSON,
-  proto,
   fetchLatestBaileysVersion,
-  type AuthenticationState,
+  useMultiFileAuthState,
   type WASocket,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import { createClient } from "@supabase/supabase-js";
 import QRCode from "qrcode";
 import pino from "pino";
+import fs from "node:fs";
+import path from "node:path";
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 const silent = pino({ level: "silent" });
@@ -38,6 +37,7 @@ const SUPABASE_URL = must("SUPABASE_URL");
 const SERVICE_KEY = must("SUPABASE_SERVICE_ROLE_KEY");
 const POLL_MS = int(process.env.POLL_MS, 4000);
 const PUMP_MS = int(process.env.PUMP_MS, 1500);
+const AUTH_DIR = process.env.AUTH_DIR || "/app/data/auth";
 
 const supa = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
 
@@ -108,46 +108,13 @@ interface Session {
 }
 const sessions = new Map<string, Session>();
 
-/* --------------------------- Supabase auth state --------------------------- */
-/** Baileys auth state persisted in wa_connections.creds (jsonb). */
-async function useSupabaseAuthState(orgId: string): Promise<{ state: AuthenticationState; saveCreds: () => Promise<void> }> {
-  const { data } = await supa.from("wa_connections").select("creds").eq("org_id", orgId).single();
-  const stored = data?.creds ? JSON.parse(JSON.stringify(data.creds), BufferJSON.reviver) : null;
-  const creds = stored?.creds || initAuthCreds();
-  const keys: Row = stored?.keys || {};
+/* --------------------------- Baileys auth state ---------------------------- */
+function authPath(orgId: string) {
+  return path.join(AUTH_DIR, orgId);
+}
 
-  const saveCreds = async () => {
-    const serial = JSON.parse(JSON.stringify({ creds, keys }, BufferJSON.replacer));
-    await supa.from("wa_connections").update({ creds: serial, updated_at: new Date().toISOString() }).eq("org_id", orgId);
-  };
-
-  const state: AuthenticationState = {
-    creds,
-    keys: {
-      get: (type, ids) => {
-        const out: Row = {};
-        for (const id of ids) {
-          let val = keys[type]?.[id];
-          if (type === "app-state-sync-key" && val) val = proto.Message.AppStateSyncKeyData.fromObject(val);
-          if (val) out[id] = val;
-        }
-        return out;
-      },
-      set: (data) => {
-        for (const type in data) {
-          keys[type] = keys[type] || {};
-          for (const id in (data as Row)[type]) {
-            const val = (data as Row)[type][id];
-            if (val == null) delete keys[type][id]; // honor deletes
-            else keys[type][id] = val;
-          }
-        }
-        // fire-and-forget; connection.update/creds.update also persist
-        void saveCreds();
-      },
-    },
-  };
-  return { state, saveCreds };
+function clearAuthState(orgId: string) {
+  try { fs.rmSync(authPath(orgId), { recursive: true, force: true }); } catch { /* noop */ }
 }
 
 async function patch(orgId: string, fields: Row) {
@@ -164,7 +131,7 @@ async function startSession(orgId: string, cfg: Session["cfg"]) {
   sessions.set(orgId, s);
 
   try {
-    const { state, saveCreds } = await useSupabaseAuthState(orgId);
+    const { state, saveCreds } = await useMultiFileAuthState(authPath(orgId));
     const { version } = await fetchLatestBaileysVersion();
     const sock = makeWASocket({
       version,
@@ -210,6 +177,7 @@ async function startSession(orgId: string, cfg: Session["cfg"]) {
         sessions.delete(orgId);
         try { sock.end(undefined as any); } catch { /* noop */ }
         if (loggedOut) {
+          clearAuthState(orgId);
           await patch(orgId, { status: "disconnected", enabled: false, qr: null, creds: null, phone_number: null });
           log.warn({ orgId }, "logged out — cleared session");
         } else {
@@ -255,6 +223,7 @@ async function logoutSession(orgId: string) {
   const s = sessions.get(orgId);
   try { await s?.sock?.logout(); } catch { /* noop */ }
   await stopSession(orgId);
+  clearAuthState(orgId);
   await patch(orgId, { status: "disconnected", enabled: false, qr: null, creds: null, phone_number: null });
   log.info({ orgId }, "unlinked");
 }
