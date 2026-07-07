@@ -344,7 +344,7 @@ async function pumpOutbox() {
       await s.sock.sendPresenceUpdate("available", jid).catch(() => undefined);
       await sleep(250);
 
-      const sent = await s.sock.sendMessage(jid, { text: row.body || "" });
+      const sent = await s.sock.sendMessage(jid, { text: row.body || "" }, { useUserDevicesCache: false } as any);
       cacheSent(sent?.key?.id, sent?.message); // enable retry-receipt resends
       s.lastSendAt = Date.now();
       await supa.from("wa_outbox").update({ status: "sent", sent_at: new Date().toISOString() }).eq("id", row.id);
