@@ -52,6 +52,10 @@ function must(k: string): string {
 }
 function int(v: string | undefined, d: number) { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : d; }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Stable 8-char pairing code (unambiguous chars) reused across refreshes so the
+// user always sees the same code to type on their phone.
+const PAIR_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function genPairCode() { let s = ""; for (let i = 0; i < 8; i++) s += PAIR_CHARS[Math.floor(Math.random() * PAIR_CHARS.length)]; return s; }
 const jidOf = (phone: string) => `${phone.replace(/[^0-9]/g, "")}@s.whatsapp.net`;
 const digits = (s: string | null | undefined) => (s || "").replace(/[^0-9]/g, "");
 const textOf = (v: unknown) => String(v ?? "").trim();
@@ -164,7 +168,14 @@ async function startSession(orgId: string, cfg: Session["cfg"], pairingPhone?: s
     if (pairingPhone && !state.creds.registered) {
       setTimeout(async () => {
         try {
-          const code = await sock.requestPairingCode(digits(pairingPhone));
+          // Reuse the existing code (kept in the DB) so it stays the same across
+          // WhatsApp's ~60s refresh cycle; only generate one on a fresh attempt.
+          const { data: row } = await supa.from("wa_connections").select("pairing_code").eq("org_id", orgId).single();
+          let custom = String(row?.pairing_code || "");
+          if (!/^[A-Z0-9]{8}$/.test(custom)) custom = genPairCode();
+          let code: string;
+          try { code = await sock.requestPairingCode(digits(pairingPhone), custom); }
+          catch { code = await sock.requestPairingCode(digits(pairingPhone)); } // fallback: WhatsApp-generated
           await patch(orgId, { status: "pairing", pairing_code: code, qr: null, worker_error: null });
           log.info({ orgId }, "pairing code issued");
         } catch (e) {
@@ -203,6 +214,11 @@ async function startSession(orgId: string, cfg: Session["cfg"], pairingPhone?: s
           clearAuthState(orgId);
           await patch(orgId, { status: "disconnected", enabled: false, qr: null, creds: null, phone_number: null });
           log.warn({ orgId }, "logged out — cleared session");
+        } else if (pairingPhone) {
+          // Pairing window timed out waiting for the code — stay in pairing mode
+          // and re-arm the SAME code (reconcile restarts the session).
+          await patch(orgId, { status: "pairing", qr: null, worker_error: null });
+          log.info({ orgId }, "pairing timed out — re-arming code");
         } else {
           await patch(orgId, { status: "connecting", qr: null, worker_error: String(lastDisconnect?.error?.message || code || "close") });
           log.warn({ orgId, code }, "closed — will reconnect");
