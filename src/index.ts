@@ -37,7 +37,11 @@ const SUPABASE_URL = must("SUPABASE_URL");
 const SERVICE_KEY = must("SUPABASE_SERVICE_ROLE_KEY");
 const POLL_MS = int(process.env.POLL_MS, 4000);
 const PUMP_MS = int(process.env.PUMP_MS, 1500);
+const AVATAR_MS = int(process.env.AVATAR_MS, 20000);
 const AUTH_DIR = process.env.AUTH_DIR || "/app/data/auth";
+// Re-fetch a contact's profile picture at most this often.
+const AVATAR_TTL_MS = 7 * 24 * 3600 * 1000;
+const AVATAR_BUCKET = "wa-avatars";
 
 const supa = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
 
@@ -201,7 +205,7 @@ async function startSession(orgId: string, cfg: Session["cfg"]) {
             || m.message?.videoMessage?.caption
             || "";
           const name = m.pushName || null;
-          await recordInbound(orgId, phone, jid, name, text);
+          await recordInbound(orgId, sock, phone, jid, name, text);
         } catch (e) { log.error({ orgId, e }, "inbound handling failed"); }
       }
     });
@@ -228,8 +232,43 @@ async function logoutSession(orgId: string) {
   log.info({ orgId }, "unlinked");
 }
 
+/* ---------------------------- Profile pictures ----------------------------- */
+// Fetch a contact's WhatsApp profile picture and store a stable copy in Supabase
+// Storage (WhatsApp's own CDN URLs expire). Throttled by wa_avatar_synced_at.
+// Best-effort: contacts who hide their picture keep the app's letter fallback.
+async function syncAvatar(orgId: string, sock: WASocket, jid: string, convId: string, force = false) {
+  try {
+    if (!force) {
+      const { data } = await supa.from("wa_conversations").select("wa_avatar_synced_at").eq("id", convId).single();
+      const last = data?.wa_avatar_synced_at ? new Date(data.wa_avatar_synced_at).getTime() : 0;
+      if (last && Date.now() - last < AVATAR_TTL_MS) return;
+    }
+    let publicUrl: string | undefined;
+    try {
+      const picUrl = await sock.profilePictureUrl(jid, "image");
+      if (picUrl) {
+        const res = await fetch(picUrl);
+        if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          const path = `${orgId}/${convId}.jpg`;
+          const { error: upErr } = await supa.storage.from(AVATAR_BUCKET).upload(path, buf, { contentType: "image/jpeg", upsert: true });
+          if (!upErr) {
+            const base = supa.storage.from(AVATAR_BUCKET).getPublicUrl(path).data.publicUrl;
+            publicUrl = `${base}?t=${Date.now()}`; // cache-bust on refresh
+          }
+        }
+      }
+    } catch { /* no picture / privacy / not reachable — keep any existing avatar */ }
+    // Stamp synced_at always (throttle); only overwrite the URL when we got one.
+    await supa.from("wa_conversations").update({
+      wa_avatar_url: publicUrl, // undefined leaves the existing value untouched
+      wa_avatar_synced_at: new Date().toISOString(),
+    }).eq("id", convId);
+  } catch (e) { log.warn({ orgId, e }, "avatar sync failed"); }
+}
+
 /* ------------------------------ Inbound writes ----------------------------- */
-async function recordInbound(orgId: string, phone: string, jid: string, name: string | null, text: string) {
+async function recordInbound(orgId: string, sock: WASocket, phone: string, jid: string, name: string | null, text: string) {
   // find/create conversation
   const { data: convs } = await supa.from("wa_conversations").select("id, unread")
     .eq("org_id", orgId).eq("wa_phone", phone).limit(1);
@@ -250,6 +289,7 @@ async function recordInbound(orgId: string, phone: string, jid: string, name: st
     await supa.from("wa_messages").insert({
       org_id: orgId, conversation_id: convId, direction: "in", body: text, status: "received",
     });
+    void syncAvatar(orgId, sock, jid, convId); // best-effort, throttled
   }
 }
 
@@ -338,6 +378,23 @@ async function pumpOutbox() {
   }
 }
 
+/* ------------------------------ Avatar sweep ------------------------------- */
+// Backfill profile pictures for conversations that don't have one yet (e.g.
+// chats started from the app, or existing chats from before this feature).
+async function avatarSweep() {
+  for (const [orgId, s] of sessions) {
+    if (!s.sock) continue;
+    const { data } = await supa.from("wa_conversations")
+      .select("id, wa_jid, wa_phone")
+      .eq("org_id", orgId).is("wa_avatar_synced_at", null).limit(8);
+    for (const c of (data as Row[]) ?? []) {
+      const jid = (c.wa_jid as string) || jidOf(c.wa_phone as string);
+      await syncAvatar(orgId, s.sock, jid, c.id as string, true);
+      await sleep(400); // gentle on WhatsApp
+    }
+  }
+}
+
 /* ------------------------------- Reconcile -------------------------------- */
 async function reconcile() {
   const { data, error } = await supa.from("wa_connections")
@@ -370,6 +427,7 @@ async function main() {
   };
   loop(reconcile, POLL_MS);
   loop(pumpOutbox, PUMP_MS);
+  loop(avatarSweep, AVATAR_MS);
 }
 
 main();
