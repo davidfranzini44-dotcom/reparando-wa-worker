@@ -107,6 +107,7 @@ interface Session {
   orgId: string;
   sock: WASocket | null;
   starting: boolean;
+  pairing?: boolean;       // started to request a phone-number pairing code
   lastSendAt: number;      // for min_gap throttle
   cfg: { min_gap_ms: number; per_min_cap: number; daily_cap: number };
 }
@@ -126,12 +127,13 @@ async function patch(orgId: string, fields: Row) {
 }
 
 /* ------------------------------- Session boot ------------------------------ */
-async function startSession(orgId: string, cfg: Session["cfg"]) {
+async function startSession(orgId: string, cfg: Session["cfg"], pairingPhone?: string | null) {
   let s = sessions.get(orgId);
   if (s?.sock || s?.starting) return;
   s = s || { orgId, sock: null, starting: false, lastSendAt: 0, cfg };
   s.cfg = cfg;
   s.starting = true;
+  s.pairing = !!pairingPhone;
   sessions.set(orgId, s);
 
   try {
@@ -157,11 +159,26 @@ async function startSession(orgId: string, cfg: Session["cfg"]) {
     s.sock = sock;
     s.starting = false;
 
+    // No-QR linking: ask WhatsApp for an 8-char pairing code the user types on
+    // their phone (Linked devices → Link with phone number instead).
+    if (pairingPhone && !state.creds.registered) {
+      setTimeout(async () => {
+        try {
+          const code = await sock.requestPairingCode(digits(pairingPhone));
+          await patch(orgId, { status: "pairing", pairing_code: code, qr: null, worker_error: null });
+          log.info({ orgId }, "pairing code issued");
+        } catch (e) {
+          await patch(orgId, { worker_error: String((e as Error)?.message || e) });
+          log.error({ orgId, e }, "requestPairingCode failed");
+        }
+      }, 3000);
+    }
+
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (u) => {
       const { connection, lastDisconnect, qr } = u;
-      if (qr) {
+      if (qr && !pairingPhone) {
         const dataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 320 });
         await patch(orgId, { status: "qr", qr: dataUrl, worker_error: null, last_seen_at: new Date().toISOString() });
         log.info({ orgId }, "qr ready");
@@ -172,7 +189,9 @@ async function startSession(orgId: string, cfg: Session["cfg"]) {
         await patch(orgId, {
           status: "connected", qr: null, phone_number: phone || null,
           connected_at: new Date().toISOString(), last_seen_at: new Date().toISOString(), worker_error: null,
+          pairing_code: null, pairing_phone: null,
         });
+        const live = sessions.get(orgId); if (live) live.pairing = false;
         log.info({ orgId, phone }, "connected");
       }
       if (connection === "close") {
@@ -398,7 +417,7 @@ async function avatarSweep() {
 /* ------------------------------- Reconcile -------------------------------- */
 async function reconcile() {
   const { data, error } = await supa.from("wa_connections")
-    .select("org_id, provider, enabled, status, min_gap_ms, per_min_cap, daily_cap")
+    .select("org_id, provider, enabled, status, pairing_phone, min_gap_ms, per_min_cap, daily_cap")
     .eq("provider", "baileys");
   if (error) { log.error({ error }, "reconcile query failed"); return; }
 
@@ -408,8 +427,18 @@ async function reconcile() {
     const cfg = { min_gap_ms: c.min_gap_ms ?? 3500, per_min_cap: c.per_min_cap ?? 10, daily_cap: c.daily_cap ?? 250 };
     if (c.status === "logout") { await logoutSession(c.org_id); continue; }
     if (!c.enabled) { await stopSession(c.org_id); continue; }
-    // pending/qr/connecting/connected → ensure a live session; heartbeat if connected
-    if (!sessions.has(c.org_id)) await startSession(c.org_id, cfg);
+    // Phone-number pairing requested → (re)start a fresh session that asks for a
+    // pairing code. Guard on the session's pairing flag so we don't restart it
+    // every tick (the worker flips status to "pairing" once the code is issued).
+    if (c.status === "pair_requested") {
+      if (!sessions.get(c.org_id)?.pairing) {
+        await stopSession(c.org_id);
+        await startSession(c.org_id, cfg, c.pairing_phone);
+      } else { sessions.get(c.org_id)!.cfg = cfg; }
+      continue;
+    }
+    // pending/qr/pairing/connecting/connected → ensure a live session; heartbeat if connected
+    if (!sessions.has(c.org_id)) await startSession(c.org_id, cfg, c.status === "pairing" ? c.pairing_phone : null);
     else {
       const s = sessions.get(c.org_id)!; s.cfg = cfg;
       if (c.status === "connected") await patch(c.org_id, { last_seen_at: new Date().toISOString() });
