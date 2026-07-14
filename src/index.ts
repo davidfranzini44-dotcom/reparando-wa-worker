@@ -41,6 +41,9 @@ const AVATAR_MS = int(process.env.AVATAR_MS, 20000);
 const AUTH_DIR = process.env.AUTH_DIR || "/app/data/auth";
 // Re-fetch a contact's profile picture at most this often.
 const AVATAR_TTL_MS = 7 * 24 * 3600 * 1000;
+// Contacts that came back without a picture are re-checked no more often than
+// this, so photos added (or made public) later eventually appear.
+const AVATAR_RECHECK_MS = 24 * 3600 * 1000;
 const AVATAR_BUCKET = "wa-avatars";
 
 const supa = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
@@ -419,10 +422,24 @@ async function pumpOutbox() {
 async function avatarSweep() {
   for (const [orgId, s] of sessions) {
     if (!s.sock) continue;
-    const { data } = await supa.from("wa_conversations")
+    // 1) Conversations never checked yet (new chats, or from before this feature).
+    const { data: fresh } = await supa.from("wa_conversations")
       .select("id, wa_jid, wa_phone")
       .eq("org_id", orgId).is("wa_avatar_synced_at", null).limit(8);
-    for (const c of (data as Row[]) ?? []) {
+    const batch = [...((fresh as Row[]) ?? [])];
+    // 2) Spare budget → re-check contacts still without a picture (oldest first),
+    //    so a photo added later (or a transient failure) eventually shows up.
+    if (batch.length < 8) {
+      const staleBefore = new Date(Date.now() - AVATAR_RECHECK_MS).toISOString();
+      const { data: stale } = await supa.from("wa_conversations")
+        .select("id, wa_jid, wa_phone")
+        .eq("org_id", orgId).is("wa_avatar_url", null)
+        .lt("wa_avatar_synced_at", staleBefore)
+        .order("wa_avatar_synced_at", { ascending: true })
+        .limit(8 - batch.length);
+      batch.push(...((stale as Row[]) ?? []));
+    }
+    for (const c of batch) {
       const jid = (c.wa_jid as string) || jidOf(c.wa_phone as string);
       await syncAvatar(orgId, s.sock, jid, c.id as string, true);
       await sleep(400); // gentle on WhatsApp
