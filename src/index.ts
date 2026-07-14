@@ -21,6 +21,7 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
+  downloadMediaMessage,
   type WASocket,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
@@ -45,6 +46,7 @@ const AVATAR_TTL_MS = 7 * 24 * 3600 * 1000;
 // this, so photos added (or made public) later eventually appear.
 const AVATAR_RECHECK_MS = 24 * 3600 * 1000;
 const AVATAR_BUCKET = "wa-avatars";
+const MEDIA_BUCKET = "wa-media";
 
 const supa = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
 
@@ -243,7 +245,9 @@ async function startSession(orgId: string, cfg: Session["cfg"], pairingPhone?: s
             || m.message?.videoMessage?.caption
             || "";
           const name = m.pushName || null;
-          await recordInbound(orgId, sock, phone, jid, name, text);
+          const media = await saveMedia(orgId, sock, m);
+          const body = text || media?.label || "";
+          await recordInbound(orgId, sock, phone, jid, name, body, media?.url ?? null, media?.type ?? null);
         } catch (e) { log.error({ orgId, e }, "inbound handling failed"); }
       }
     });
@@ -305,8 +309,34 @@ async function syncAvatar(orgId: string, sock: WASocket, jid: string, convId: st
   } catch (e) { log.warn({ orgId, e }, "avatar sync failed"); }
 }
 
+/* ------------------------------ Inbound media ------------------------------ */
+// Download inbound media (voice notes, images, video, docs, stickers) and
+// re-host it in Storage so the inbox can play/show it. null for text-only.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function saveMedia(orgId: string, sock: WASocket, m: any): Promise<{ url: string; type: string; label: string } | null> {
+  const msg = m.message;
+  if (!msg) return null;
+  let type: string, mimetype: string | undefined, ext: string, label: string;
+  if (msg.audioMessage) { type = "audio"; mimetype = msg.audioMessage.mimetype; ext = "ogg"; label = msg.audioMessage.ptt ? "🎤 Nota de voz" : "🎵 Audio"; }
+  else if (msg.imageMessage) { type = "image"; mimetype = msg.imageMessage.mimetype; ext = "jpg"; label = "📷 Foto"; }
+  else if (msg.videoMessage) { type = "video"; mimetype = msg.videoMessage.mimetype; ext = "mp4"; label = "🎥 Video"; }
+  else if (msg.stickerMessage) { type = "sticker"; mimetype = msg.stickerMessage.mimetype; ext = "webp"; label = "🖼️ Sticker"; }
+  else if (msg.documentMessage) { type = "document"; mimetype = msg.documentMessage.mimetype; ext = msg.documentMessage.fileName?.split(".").pop() || "bin"; label = "📄 " + (msg.documentMessage.fileName || "Documento"); }
+  else return null;
+  try {
+    const buf = (await downloadMediaMessage(m, "buffer", {}, { logger: silent as any, reuploadRequest: sock.updateMediaMessage })) as Buffer;
+    const id = (m.key?.id as string) || String(Date.now());
+    const objPath = `${orgId}/${id}.${ext}`;
+    const contentType = (mimetype || "").split(";")[0] || "application/octet-stream";
+    const { error } = await supa.storage.from(MEDIA_BUCKET).upload(objPath, buf, { contentType, upsert: true });
+    if (error) { log.warn({ orgId, error }, "media upload failed"); return null; }
+    const url = `${supa.storage.from(MEDIA_BUCKET).getPublicUrl(objPath).data.publicUrl}?t=${Date.now()}`;
+    return { url, type, label };
+  } catch (e) { log.warn({ orgId, e }, "media download failed"); return null; }
+}
+
 /* ------------------------------ Inbound writes ----------------------------- */
-async function recordInbound(orgId: string, sock: WASocket, phone: string, jid: string, name: string | null, text: string) {
+async function recordInbound(orgId: string, sock: WASocket, phone: string, jid: string, name: string | null, text: string, mediaUrl: string | null = null, mediaType: string | null = null) {
   // find/create conversation
   const { data: convs } = await supa.from("wa_conversations").select("id, unread")
     .eq("org_id", orgId).eq("wa_phone", phone).limit(1);
@@ -326,6 +356,7 @@ async function recordInbound(orgId: string, sock: WASocket, phone: string, jid: 
   if (convId) {
     await supa.from("wa_messages").insert({
       org_id: orgId, conversation_id: convId, direction: "in", body: text, status: "received",
+      media_url: mediaUrl, media_type: mediaType,
     });
     void syncAvatar(orgId, sock, jid, convId); // best-effort, throttled
   }
